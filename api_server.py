@@ -21,6 +21,8 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -63,6 +65,8 @@ class TaskRecord(BaseModel):
     image_base64: Optional[str] = None
     description: Optional[str] = None
     error: Optional[str] = None
+    webhook_url: Optional[str] = None
+    webhook_include_image: bool = False
 
 
 _tasks: dict[str, TaskRecord] = {}
@@ -82,12 +86,16 @@ class GenerateRequest(BaseModel):
     source_context: str = Field(description="Methodology text or paper excerpt")
     caption: str = Field(description="Figure caption")
     iterations: int = Field(default=3, ge=1, le=10)
+    webhook_url: Optional[str] = Field(default=None, description="URL to POST result to when task completes")
+    webhook_include_image: bool = Field(default=False, description="Include image_base64 in webhook payload")
 
 
 class PlotRequest(BaseModel):
     data_json: str = Field(description="JSON string with data to plot")
     intent: str = Field(description="Description of the desired plot")
     iterations: int = Field(default=3, ge=1, le=10)
+    webhook_url: Optional[str] = Field(default=None, description="URL to POST result to when task completes")
+    webhook_include_image: bool = Field(default=False, description="Include image_base64 in webhook payload")
 
 
 class TaskSubmitted(BaseModel):
@@ -114,12 +122,16 @@ class HealthResponse(BaseModel):
 class CreateKeyRequest(BaseModel):
     name: str = Field(description="Name / label for the API key")
     quota: int = Field(ge=1, description="Initial quota to assign")
+    webhook_url: Optional[str] = Field(default=None, description="Default webhook URL for this key")
+    webhook_secret: Optional[str] = Field(default=None, description="Secret for HMAC signature on webhooks")
 
 
 class UpdateKeyRequest(BaseModel):
     quota_remaining: Optional[int] = Field(default=None, ge=0)
     quota_total: Optional[int] = Field(default=None, ge=0)
     active: Optional[bool] = None
+    webhook_url: Optional[str] = None
+    webhook_secret: Optional[str] = None
 
 
 class ApiKeyInfo(BaseModel):
@@ -130,6 +142,7 @@ class ApiKeyInfo(BaseModel):
     total_used: int
     active: bool
     created_at: str
+    webhook_url: Optional[str] = None
 
 
 class ApiKeyDetail(ApiKeyInfo):
@@ -159,9 +172,17 @@ def _init_db(db_path: str) -> sqlite3.Connection:
             quota_total     INTEGER NOT NULL,
             total_used      INTEGER NOT NULL DEFAULT 0,
             active       INTEGER NOT NULL DEFAULT 1,
-            created_at   TEXT NOT NULL
+            created_at   TEXT NOT NULL,
+            webhook_url  TEXT,
+            webhook_secret TEXT
         )
     """)
+    # Migrate: add webhook columns if missing
+    _cols = {r[1] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()}
+    if "webhook_url" not in _cols:
+        conn.execute("ALTER TABLE api_keys ADD COLUMN webhook_url TEXT")
+    if "webhook_secret" not in _cols:
+        conn.execute("ALTER TABLE api_keys ADD COLUMN webhook_secret TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS usage_log (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,9 +205,24 @@ def _init_db(db_path: str) -> sqlite3.Connection:
             image_path   TEXT,
             error        TEXT,
             created_at   TEXT NOT NULL,
-            completed_at TEXT
+            completed_at TEXT,
+            webhook_url  TEXT,
+            webhook_include_image INTEGER NOT NULL DEFAULT 0,
+            webhook_status TEXT,
+            webhook_attempts INTEGER NOT NULL DEFAULT 0,
+            webhook_last_error TEXT
         )
     """)
+    # Migrate: add webhook columns if missing
+    _thcols = {r[1] for r in conn.execute("PRAGMA table_info(task_history)").fetchall()}
+    for _c, _t, _d in [
+        ("webhook_url", "TEXT", None), ("webhook_include_image", "INTEGER NOT NULL", "0"),
+        ("webhook_status", "TEXT", None), ("webhook_attempts", "INTEGER NOT NULL", "0"),
+        ("webhook_last_error", "TEXT", None),
+    ]:
+        if _c not in _thcols:
+            default = f" DEFAULT {_d}" if _d is not None else ""
+            conn.execute(f"ALTER TABLE task_history ADD COLUMN {_c} {_t}{default}")
     conn.commit()
     return conn
 
@@ -241,6 +277,7 @@ async def verify_admin(authorization: str | None = Header(default=None)) -> str:
 
 def _save_task_history(
     task_id: str, api_key: str, endpoint: str, diagram_type: str, input_params: dict,
+    webhook_url: str | None = None, webhook_include_image: bool = False,
 ) -> None:
     db = _get_db()
     now = datetime.now(timezone.utc).isoformat()
@@ -250,9 +287,11 @@ def _save_task_history(
         key_name = row["name"]
     db.execute(
         "INSERT OR IGNORE INTO task_history "
-        "(task_id, api_key, key_name, endpoint, diagram_type, status, input_params, created_at) "
-        "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-        (task_id, api_key, key_name, endpoint, diagram_type, json.dumps(input_params), now),
+        "(task_id, api_key, key_name, endpoint, diagram_type, status, input_params, "
+        "webhook_url, webhook_include_image, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+        (task_id, api_key, key_name, endpoint, diagram_type,
+         json.dumps(input_params), webhook_url, int(webhook_include_image), now),
     )
     db.commit()
 
@@ -289,6 +328,103 @@ def _deduct_quota(api_key: str, task_id: str, endpoint: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_webhook(api_key: str, req_url: str | None, req_include: bool) -> tuple[str | None, bool, str | None]:
+    """Return (webhook_url, include_image, webhook_secret). Per-request overrides per-key."""
+    db = _get_db()
+    row = db.execute("SELECT webhook_url, webhook_secret FROM api_keys WHERE key = ?", (api_key,)).fetchone()
+    key_url = row["webhook_url"] if row else None
+    key_secret = row["webhook_secret"] if row else None
+    url = req_url or key_url
+    return url, req_include, key_secret
+
+
+async def _send_webhook(task_id: str) -> None:
+    """POST the task result to the configured webhook URL with retries."""
+    import httpx
+
+    db = _get_db()
+    row = db.execute("SELECT * FROM task_history WHERE task_id = ?", (task_id,)).fetchone()
+    if row is None:
+        return
+    wh_url = row["webhook_url"]
+    if not wh_url:
+        return
+
+    include_image = bool(row["webhook_include_image"])
+
+    # Look up webhook_secret from the API key
+    key_row = db.execute("SELECT webhook_secret FROM api_keys WHERE key = ?", (row["api_key"],)).fetchone()
+    wh_secret = key_row["webhook_secret"] if key_row else None
+
+    # Build payload
+    payload: dict[str, Any] = {
+        "event": "task.completed" if row["status"] == "completed" else "task.failed",
+        "task_id": row["task_id"],
+        "status": row["status"],
+        "diagram_type": row["diagram_type"],
+        "description": row["description"],
+        "image_url": f"https://pb.gptayn.com/api/tasks/{row['task_id']}/image",
+        "image_base64": None,
+        "error": row["error"],
+        "created_at": row["created_at"],
+        "completed_at": row["completed_at"],
+    }
+    if include_image and row.get("image_path") and Path(row["image_path"]).exists():
+        try:
+            img = load_image(row["image_path"])
+            payload["image_base64"] = image_to_base64(img)
+        except Exception:
+            pass
+
+    body_bytes = json.dumps(payload).encode()
+
+    # Compute HMAC signature
+    hdrs: dict[str, str] = {
+        "Content-Type": "application/json",
+        "X-PaperBanana-Event": payload["event"],
+        "User-Agent": "PaperBanana-Webhook/0.1.2",
+    }
+    if wh_secret:
+        sig = hmac.new(wh_secret.encode(), body_bytes, hashlib.sha256).hexdigest()
+        hdrs["X-PaperBanana-Signature"] = f"sha256={sig}"
+
+    # Retry up to 3 times: 5s, 15s, 60s
+    delays = [5, 15, 60]
+    last_error = None
+    async with httpx.AsyncClient(timeout=30) as client:
+        for attempt in range(3):
+            try:
+                resp = await client.post(wh_url, content=body_bytes, headers=hdrs)
+                if resp.status_code < 400:
+                    db.execute(
+                        "UPDATE task_history SET webhook_status='delivered', webhook_attempts=? WHERE task_id=?",
+                        (attempt + 1, task_id),
+                    )
+                    db.commit()
+                    return
+                last_error = f"HTTP {resp.status_code}"
+            except Exception as exc:
+                last_error = str(exc)
+
+            db.execute(
+                "UPDATE task_history SET webhook_status='retrying', webhook_attempts=?, webhook_last_error=? "
+                "WHERE task_id=?",
+                (attempt + 1, last_error, task_id),
+            )
+            db.commit()
+
+            if attempt < 2:
+                await asyncio.sleep(delays[attempt])
+
+    # All retries exhausted
+    db.execute(
+        "UPDATE task_history SET webhook_status='failed', webhook_attempts=3, webhook_last_error=? "
+        "WHERE task_id=?",
+        (last_error, task_id),
+    )
+    db.commit()
+
+
 async def _run_generation(
     task_id: str,
     gen_input: GenerationInput,
@@ -314,6 +450,10 @@ async def _run_generation(
         record.error = str(exc)
         record.status = TaskStatus.FAILED
         _update_task_history(task_id, "failed", error=str(exc))
+
+    # Fire webhook if configured
+    if record.webhook_url:
+        asyncio.create_task(_send_webhook(task_id))
 
 # ---------------------------------------------------------------------------
 # Lifespan — load settings + init DB at startup
@@ -700,6 +840,8 @@ tr:hover td{background:rgba(88,166,255,.04)}
     <h3>Create API Key</h3>
     <div class="field"><label>Name</label><input id="create-name" placeholder="e.g. my-app"></div>
     <div class="field"><label>Quota</label><input id="create-quota" type="number" min="1" value="100"></div>
+    <div class="field"><label>Webhook URL <span style="color:var(--text-muted);font-weight:400">(optional)</span></label><input id="create-webhook-url" placeholder="https://your-server.com/callback"></div>
+    <div class="field"><label>Webhook Secret <span style="color:var(--text-muted);font-weight:400">(optional, for HMAC signature)</span></label><input id="create-webhook-secret" placeholder="your-secret-string"></div>
     <div class="btn-row">
       <button onclick="hideCreateModal()">Cancel</button>
       <button class="primary" onclick="createKey()">Create</button>
@@ -717,6 +859,8 @@ tr:hover td{background:rgba(88,166,255,.04)}
     <div class="field"><label>Active</label>
       <select id="edit-active"><option value="true">Active</option><option value="false">Inactive</option></select>
     </div>
+    <div class="field"><label>Webhook URL</label><input id="edit-webhook-url" placeholder="https://your-server.com/callback"></div>
+    <div class="field"><label>Webhook Secret</label><input id="edit-webhook-secret" placeholder="Leave empty to keep current"></div>
     <div class="btn-row">
       <button onclick="hideEditModal()">Cancel</button>
       <button class="primary" onclick="saveEdit()">Save</button>
@@ -806,7 +950,7 @@ function renderTable(keys) {
       <td class="actions">
         <button onclick="showDetail('${k.key}')">Detail</button>
         <button onclick="copyKey('${k.key}')">Copy</button>
-        <button onclick="showEditModal('${k.key}',${k.quota_remaining},${k.quota_total},${k.active})">Edit</button>
+        <button onclick="showEditModal('${k.key}',${k.quota_remaining},${k.quota_total},${k.active},'${esc(k.webhook_url||'')}')">Edit</button>
         <button class="danger" onclick="deleteKey('${k.key}')">Delete</button>
       </td>`;
     tbody.appendChild(tr);
@@ -854,10 +998,15 @@ async function createKey() {
   const name = document.getElementById('create-name').value.trim();
   const quota = parseInt(document.getElementById('create-quota').value);
   if (!name || !quota) return;
+  const body = {name, quota};
+  const whUrl = document.getElementById('create-webhook-url').value.trim();
+  const whSecret = document.getElementById('create-webhook-secret').value.trim();
+  if (whUrl) body.webhook_url = whUrl;
+  if (whSecret) body.webhook_secret = whSecret;
   try {
     const r = await fetch(API + '/api/admin/keys', {
       method: 'POST', headers: headers(),
-      body: JSON.stringify({name, quota})
+      body: JSON.stringify(body)
     });
     if (r.ok) {
       const data = await r.json();
@@ -865,17 +1014,21 @@ async function createKey() {
       hideCreateModal();
       document.getElementById('create-name').value = '';
       document.getElementById('create-quota').value = '100';
+      document.getElementById('create-webhook-url').value = '';
+      document.getElementById('create-webhook-secret').value = '';
       await loadKeys();
     }
   } catch(e) { console.error(e); }
 }
 
 // --- Edit ---
-function showEditModal(key, remaining, total, active) {
+function showEditModal(key, remaining, total, active, webhookUrl) {
   document.getElementById('edit-key-id').value = key;
   document.getElementById('edit-remaining').value = remaining;
   document.getElementById('edit-total').value = total;
   document.getElementById('edit-active').value = active ? 'true' : 'false';
+  document.getElementById('edit-webhook-url').value = webhookUrl || '';
+  document.getElementById('edit-webhook-secret').value = '';
   document.getElementById('edit-modal').classList.add('show');
 }
 function hideEditModal() { document.getElementById('edit-modal').classList.remove('show'); }
@@ -887,6 +1040,10 @@ async function saveEdit() {
     quota_total: parseInt(document.getElementById('edit-total').value),
     active: document.getElementById('edit-active').value === 'true'
   };
+  const whUrl = document.getElementById('edit-webhook-url').value.trim();
+  body.webhook_url = whUrl || '';
+  const whSecret = document.getElementById('edit-webhook-secret').value.trim();
+  if (whSecret) body.webhook_secret = whSecret;
   try {
     await fetch(API + '/api/admin/keys/' + key, {
       method: 'PATCH', headers: headers(),
@@ -1334,6 +1491,7 @@ td code{font-size:.8rem}
     <div class="group">Generation</div>
     <a href="#generate">Generate Diagram</a>
     <a href="#plot">Generate Plot</a>
+    <a href="#webhooks">Webhooks</a>
     <a href="#get-task">Get Task Status</a>
     <a href="#get-image">Download Image</a>
 
@@ -1682,6 +1840,173 @@ task_id = r.json()["task_id"]
 </div>
 
 <!-- ============================================================ -->
+<!-- WEBHOOKS -->
+<!-- ============================================================ -->
+<h2 id="webhooks">Webhooks</h2>
+<p>
+  Instead of polling for task completion, you can provide a <code>webhook_url</code> to receive
+  an HTTP POST callback when the task finishes (or fails).
+</p>
+
+<h3>Configuration</h3>
+<p>Webhooks can be configured at two levels:</p>
+<table>
+  <tr><th>Level</th><th>How</th><th>Precedence</th></tr>
+  <tr>
+    <td><strong>Per-key</strong> (default)</td>
+    <td>Set <code>webhook_url</code> and <code>webhook_secret</code> when creating or updating an API key via the admin API</td>
+    <td>Used when no per-request URL is provided</td>
+  </tr>
+  <tr>
+    <td><strong>Per-request</strong> (override)</td>
+    <td>Pass <code>webhook_url</code> in the <code>/api/generate</code> or <code>/api/plot</code> request body</td>
+    <td>Overrides the per-key default</td>
+  </tr>
+</table>
+
+<h4>Request fields (on generate / plot)</h4>
+<table>
+  <tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
+  <tr><td><code>webhook_url</code></td><td>string</td><td>No</td><td>URL to POST the result to when task completes/fails</td></tr>
+  <tr><td><code>webhook_include_image</code></td><td>boolean</td><td>No</td><td>If <code>true</code>, include <code>image_base64</code> in the payload (default: <code>false</code>)</td></tr>
+</table>
+
+<h3>Webhook Payload</h3>
+<p>When a task completes or fails, PaperBanana sends an HTTP POST to the webhook URL:</p>
+<pre><code>POST https://your-server.com/callback
+Content-Type: application/json
+X-PaperBanana-Event: task.completed
+X-PaperBanana-Signature: sha256=a1b2c3d4...
+User-Agent: PaperBanana-Webhook/0.1.2
+
+{
+  "event": "task.completed",
+  "task_id": "a1b2c3d4e5f6...",
+  "status": "completed",
+  "diagram_type": "methodology",
+  "description": "The diagram shows...",
+  "image_url": "https://pb.gptayn.com/api/tasks/a1b2c3d4e5f6/image",
+  "image_base64": null,
+  "error": null,
+  "created_at": "2026-02-15T10:30:00+00:00",
+  "completed_at": "2026-02-15T10:31:25+00:00"
+}</code></pre>
+
+<div class="info-box note">
+  <strong>Note</strong>
+  <code>image_base64</code> is only populated when <code>webhook_include_image</code> is <code>true</code>.
+  Otherwise, use <code>image_url</code> to fetch the image separately (requires Bearer token).
+</div>
+
+<h3>Signature Verification</h3>
+<p>
+  If a <code>webhook_secret</code> is configured on the API key, the request includes an
+  <code>X-PaperBanana-Signature</code> header containing an HMAC-SHA256 signature of the
+  request body, using the secret as the key.
+</p>
+
+<div class="code-tabs" data-group="webhook-verify">
+  <div class="code-tab-btns">
+    <button class="code-tab-btn active" onclick="showCodeTab(this,'webhook-verify','py')">Python</button>
+    <button class="code-tab-btn" onclick="showCodeTab(this,'webhook-verify','js')">JavaScript</button>
+  </div>
+  <div class="code-tab-content active" data-tab="webhook-verify-py">
+    <pre><code>import hmac, hashlib
+
+def verify_signature(body: bytes, signature: str, secret: str) -> bool:
+    expected = "sha256=" + hmac.new(
+        secret.encode(), body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+# In your Flask/FastAPI handler:
+# sig = request.headers.get("X-PaperBanana-Signature", "")
+# is_valid = verify_signature(request.body, sig, "your-webhook-secret")</code></pre>
+  </div>
+  <div class="code-tab-content" data-tab="webhook-verify-js">
+    <pre><code>const crypto = require("crypto");
+
+function verifySignature(body, signature, secret) {
+  const expected = "sha256=" + crypto
+    .createHmac("sha256", secret)
+    .update(body)
+    .digest("hex");
+  return crypto.timingSafeEqual(
+    Buffer.from(expected), Buffer.from(signature)
+  );
+}
+
+// In your Express handler:
+// const sig = req.headers["x-paperbanana-signature"];
+// const valid = verifySignature(JSON.stringify(req.body), sig, "your-secret");</code></pre>
+  </div>
+</div>
+
+<h3>Retry Policy</h3>
+<p>If the webhook delivery fails (network error or HTTP &ge; 400), PaperBanana retries up to <strong>3 times</strong>:</p>
+<table>
+  <tr><th>Attempt</th><th>Delay</th></tr>
+  <tr><td>1st retry</td><td>5 seconds</td></tr>
+  <tr><td>2nd retry</td><td>15 seconds</td></tr>
+  <tr><td>3rd retry</td><td>60 seconds</td></tr>
+</table>
+<p>Webhook delivery status is visible in the <a href="/history">History</a> page for each task.</p>
+
+<h3>Example: Generate with Webhook</h3>
+<div class="code-tabs" data-group="webhook-ex">
+  <div class="code-tab-btns">
+    <button class="code-tab-btn active" onclick="showCodeTab(this,'webhook-ex','curl')">cURL</button>
+    <button class="code-tab-btn" onclick="showCodeTab(this,'webhook-ex','py')">Python</button>
+    <button class="code-tab-btn" onclick="showCodeTab(this,'webhook-ex','js')">JavaScript</button>
+  </div>
+  <div class="code-tab-content active" data-tab="webhook-ex-curl">
+    <pre><code>curl -X POST https://pb.gptayn.com/api/generate \\
+  -H "Authorization: Bearer pb_your_api_key_here" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "source_context": "Our model uses a 6-layer Transformer encoder...",
+    "caption": "Figure 1: Transformer architecture",
+    "iterations": 3,
+    "webhook_url": "https://your-server.com/pb-callback",
+    "webhook_include_image": false
+  }'
+
+# Response: {"task_id": "abc123...", "status": "pending"}
+# When done, PaperBanana POSTs the result to your webhook URL.</code></pre>
+  </div>
+  <div class="code-tab-content" data-tab="webhook-ex-py">
+    <pre><code>import requests
+
+r = requests.post("https://pb.gptayn.com/api/generate", headers=HEADERS, json={
+    "source_context": "Our model uses a 6-layer Transformer encoder...",
+    "caption": "Figure 1: Transformer architecture",
+    "iterations": 3,
+    "webhook_url": "https://your-server.com/pb-callback",
+    "webhook_include_image": False,
+})
+print(r.json())  # {"task_id": "...", "status": "pending"}
+# No polling needed! Your webhook endpoint will receive the result.</code></pre>
+  </div>
+  <div class="code-tab-content" data-tab="webhook-ex-js">
+    <pre><code>const res = await fetch("https://pb.gptayn.com/api/generate", {
+  method: "POST",
+  headers: {
+    "Authorization": "Bearer pb_your_api_key_here",
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    source_context: "Our model uses a 6-layer Transformer encoder...",
+    caption: "Figure 1: Transformer architecture",
+    iterations: 3,
+    webhook_url: "https://your-server.com/pb-callback",
+    webhook_include_image: false
+  })
+});
+// No polling needed — result will arrive at your webhook.</code></pre>
+  </div>
+</div>
+
+<!-- ============================================================ -->
 <h2 id="get-task">Get Task Status &amp; Result</h2>
 <p><span class="method get">GET</span><span class="endpoint-path">/api/tasks/{task_id}</span></p>
 <p>
@@ -1837,6 +2162,8 @@ print(f"Downloaded {len(r.content)} bytes")</code></pre>
   <tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
   <tr><td><code>name</code></td><td>string</td><td>Yes</td><td>A label for the key (e.g. "my-app", "research-team")</td></tr>
   <tr><td><code>quota</code></td><td>integer</td><td>Yes</td><td>Initial quota to assign (min: 1)</td></tr>
+  <tr><td><code>webhook_url</code></td><td>string</td><td>No</td><td>Default webhook URL for all tasks using this key</td></tr>
+  <tr><td><code>webhook_secret</code></td><td>string</td><td>No</td><td>Secret for HMAC-SHA256 signature on webhook payloads</td></tr>
 </table>
 
 <h4>Response <code>201 Created</code></h4>
@@ -1847,7 +2174,8 @@ print(f"Downloaded {len(r.content)} bytes")</code></pre>
   "quota_total": 100,
   "total_used": 0,
   "active": true,
-  "created_at": "2026-02-15T10:30:00+00:00"
+  "created_at": "2026-02-15T10:30:00+00:00",
+  "webhook_url": "https://your-server.com/callback"
 }</code></pre>
 
 <div class="info-box warn">
@@ -1995,6 +2323,8 @@ print(f"Usage log: {len(detail['usage_log'])} entries")</code></pre>
   <tr><td><code>quota_remaining</code></td><td>integer</td><td>No</td><td>Set remaining quota (min: 0)</td></tr>
   <tr><td><code>quota_total</code></td><td>integer</td><td>No</td><td>Set total quota (min: 0)</td></tr>
   <tr><td><code>active</code></td><td>boolean</td><td>No</td><td>Enable or disable the key</td></tr>
+  <tr><td><code>webhook_url</code></td><td>string</td><td>No</td><td>Update default webhook URL (empty string to remove)</td></tr>
+  <tr><td><code>webhook_secret</code></td><td>string</td><td>No</td><td>Update webhook secret (empty string to remove)</td></tr>
 </table>
 
 <h4>Response <code>200</code></h4>
@@ -2479,6 +2809,13 @@ function renderDetail(d) {
   html += metaItem('Created', fmtTime(d.created_at));
   if (d.completed_at) html += metaItem('Completed', fmtTime(d.completed_at));
   html += metaItem('Duration', calcDuration(d.created_at, d.completed_at));
+  if (d.webhook_url) {
+    html += metaItem('Webhook URL', '<span style="font-size:.8rem;word-break:break-all">' + esc(d.webhook_url) + '</span>');
+    const whBadge = d.webhook_status === 'delivered' ? 'completed' : d.webhook_status === 'failed' ? 'failed' : 'running';
+    html += metaItem('Webhook', '<span class="badge ' + whBadge + '">' + (d.webhook_status || 'pending') + '</span>' +
+      (d.webhook_attempts ? ' (' + d.webhook_attempts + ' attempts)' : '') +
+      (d.webhook_last_error ? '<div style="font-size:.75rem;color:var(--red);margin-top:4px">' + esc(d.webhook_last_error) + '</div>' : ''));
+  }
   html += '</div>';
 
   // Input
@@ -2616,16 +2953,19 @@ async def generate(req: GenerateRequest, api_key: str = Depends(verify_api_key))
         diagram_type=DiagramType.METHODOLOGY,
     )
 
+    wh_url, wh_include, _wh_sec = _resolve_webhook(api_key, req.webhook_url, req.webhook_include_image)
+
     record = TaskRecord(
         task_id=task_id, status=TaskStatus.PENDING,
         diagram_type="methodology", api_key=api_key,
+        webhook_url=wh_url, webhook_include_image=wh_include,
     )
     _tasks[task_id] = record
 
     _deduct_quota(api_key, task_id, "generate")
     _save_task_history(task_id, api_key, "generate", "methodology", {
         "source_context": req.source_context, "caption": req.caption, "iterations": req.iterations,
-    })
+    }, webhook_url=wh_url, webhook_include_image=wh_include)
 
     asyncio.create_task(_run_generation(task_id, gen_input, settings))
     return TaskSubmitted(task_id=task_id, status=TaskStatus.PENDING)
@@ -2653,16 +2993,19 @@ async def plot(req: PlotRequest, api_key: str = Depends(verify_api_key)):
         raw_data=raw_data,
     )
 
+    wh_url, wh_include, _wh_sec = _resolve_webhook(api_key, req.webhook_url, req.webhook_include_image)
+
     record = TaskRecord(
         task_id=task_id, status=TaskStatus.PENDING,
         diagram_type="statistical_plot", api_key=api_key,
+        webhook_url=wh_url, webhook_include_image=wh_include,
     )
     _tasks[task_id] = record
 
     _deduct_quota(api_key, task_id, "plot")
     _save_task_history(task_id, api_key, "plot", "statistical_plot", {
         "data_json": req.data_json, "intent": req.intent, "iterations": req.iterations,
-    })
+    }, webhook_url=wh_url, webhook_include_image=wh_include)
 
     asyncio.create_task(_run_generation(task_id, gen_input, settings))
     return TaskSubmitted(task_id=task_id, status=TaskStatus.PENDING)
@@ -2708,15 +3051,16 @@ async def create_key(req: CreateKeyRequest, _: str = Depends(verify_admin)):
     key = _generate_api_key()
     now = datetime.now(timezone.utc).isoformat()
     db.execute(
-        "INSERT INTO api_keys (key, name, quota_remaining, quota_total, total_used, active, created_at) "
-        "VALUES (?, ?, ?, ?, 0, 1, ?)",
-        (key, req.name, req.quota, req.quota, now),
+        "INSERT INTO api_keys (key, name, quota_remaining, quota_total, total_used, active, created_at, "
+        "webhook_url, webhook_secret) VALUES (?, ?, ?, ?, 0, 1, ?, ?, ?)",
+        (key, req.name, req.quota, req.quota, now, req.webhook_url, req.webhook_secret),
     )
     db.commit()
     return ApiKeyInfo(
         key=key, name=req.name,
         quota_remaining=req.quota, quota_total=req.quota,
         total_used=0, active=True, created_at=now,
+        webhook_url=req.webhook_url,
     )
 
 
@@ -2730,6 +3074,7 @@ async def list_keys(_: str = Depends(verify_admin)):
             quota_remaining=r["quota_remaining"], quota_total=r["quota_total"],
             total_used=r["total_used"], active=bool(r["active"]),
             created_at=r["created_at"],
+            webhook_url=r["webhook_url"],
         )
         for r in rows
     ]
@@ -2750,6 +3095,7 @@ async def get_key(key: str, _: str = Depends(verify_admin)):
         quota_remaining=row["quota_remaining"], quota_total=row["quota_total"],
         total_used=row["total_used"], active=bool(row["active"]),
         created_at=row["created_at"],
+        webhook_url=row["webhook_url"],
         usage_log=[dict(r) for r in logs],
     )
 
@@ -2772,6 +3118,12 @@ async def update_key(key: str, req: UpdateKeyRequest, _: str = Depends(verify_ad
     if req.active is not None:
         updates.append("active = ?")
         params.append(int(req.active))
+    if req.webhook_url is not None:
+        updates.append("webhook_url = ?")
+        params.append(req.webhook_url if req.webhook_url else None)
+    if req.webhook_secret is not None:
+        updates.append("webhook_secret = ?")
+        params.append(req.webhook_secret if req.webhook_secret else None)
 
     if updates:
         params.append(key)
@@ -2784,6 +3136,7 @@ async def update_key(key: str, req: UpdateKeyRequest, _: str = Depends(verify_ad
         quota_remaining=updated["quota_remaining"], quota_total=updated["quota_total"],
         total_used=updated["total_used"], active=bool(updated["active"]),
         created_at=updated["created_at"],
+        webhook_url=updated["webhook_url"],
     )
 
 
