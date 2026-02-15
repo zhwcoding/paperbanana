@@ -70,3 +70,7 @@ CLAUDE.md
 .pytest_cache/
 .venv/
 .env
+
+*.db
+*.db-shm
+*.db-wal

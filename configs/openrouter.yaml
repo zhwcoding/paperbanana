@@ -1,0 +1,25 @@
+# PaperBanana — OpenRouter Configuration
+# Uses OpenRouter API for both VLM and image generation
+
+vlm:
+  provider: openrouter
+  model: google/gemini-3-flash-preview
+
+image:
+  provider: openrouter_imagen
+  model: google/gemini-3-pro-image-preview
+
+pipeline:
+  num_retrieval_examples: 10
+  refinement_iterations: 3
+  output_resolution: "2k"
+
+reference:
+  path: data/reference_sets
+  guidelines_path: data/guidelines
+
+output:
+  dir: outputs
+  save_iterations: true
+  save_prompts: true
+  save_metadata: true
