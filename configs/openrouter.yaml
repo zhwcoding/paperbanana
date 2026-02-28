@@ -6,8 +6,8 @@ vlm:
   model: google/gemini-3-flash-preview
 
 image:
-  provider: openrouter_imagen
-  model: google/gemini-3-pro-image-preview
+  provider: kie_imagen
+  model: nano-banana-pro
 
 pipeline:
   num_retrieval_examples: 10

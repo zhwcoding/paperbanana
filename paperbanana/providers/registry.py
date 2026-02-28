@@ -56,7 +56,15 @@ class ProviderRegistry:
                 api_key=settings.openrouter_api_key,
                 model=settings.image_model,
             )
+        elif provider == "kie_imagen":
+            from paperbanana.providers.image_gen.kie_imagen import KieImageGen
+
+            return KieImageGen(
+                api_key=settings.kie_api_key,
+                model=settings.image_model,
+            )
         else:
             raise ValueError(
-                f"Unknown image provider: {provider}. Available: google_imagen, openrouter_imagen"
+                f"Unknown image provider: {provider}. "
+                f"Available: google_imagen, openrouter_imagen, kie_imagen"
             )
