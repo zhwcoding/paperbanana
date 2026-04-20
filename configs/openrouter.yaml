@@ -2,8 +2,8 @@
 # Uses OpenRouter API for both VLM and image generation
 
 vlm:
-  provider: openrouter
-  model: google/gemini-3-flash-preview
+  provider: kie
+  model: gemini-3-flash
 
 image:
   provider: kie_imagen

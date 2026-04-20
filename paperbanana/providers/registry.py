@@ -33,8 +33,15 @@ class ProviderRegistry:
                 api_key=settings.openrouter_api_key,
                 model=settings.vlm_model,
             )
+        elif provider == "kie":
+            from paperbanana.providers.vlm.kie import KieVLM
+
+            return KieVLM(
+                api_key=settings.kie_api_key,
+                model=settings.vlm_model,
+            )
         else:
-            raise ValueError(f"Unknown VLM provider: {provider}. Available: gemini, openrouter")
+            raise ValueError(f"Unknown VLM provider: {provider}. Available: gemini, openrouter, kie")
 
     @staticmethod
     def create_image_gen(settings: Settings) -> ImageGenProvider:

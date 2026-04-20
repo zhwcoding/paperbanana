@@ -425,6 +425,31 @@ async def _send_webhook(task_id: str) -> None:
     db.commit()
 
 
+def _format_exception(exc: Exception) -> str:
+    """Extract the most useful error message for API responses and DB records."""
+    last_attempt = getattr(exc, "last_attempt", None)
+    if last_attempt is not None and hasattr(last_attempt, "exception"):
+        nested = last_attempt.exception()
+        if nested is not None and nested is not exc:
+            return _format_exception(nested)
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status_code = getattr(response, "status_code", None)
+        body = ""
+        try:
+            body = response.text.strip()
+        except Exception:
+            body = ""
+        if len(body) > 2000:
+            body = body[:2000] + "..."
+        if body:
+            return f"{type(exc).__name__}: HTTP {status_code}: {body}"
+        return f"{type(exc).__name__}: HTTP {status_code}"
+
+    return f"{type(exc).__name__}: {exc}"
+
+
 async def _run_generation(
     task_id: str,
     gen_input: GenerationInput,
@@ -447,9 +472,10 @@ async def _run_generation(
         record.status = TaskStatus.COMPLETED
         _update_task_history(task_id, "completed", result.description, result.image_path)
     except Exception as exc:
-        record.error = str(exc)
+        error_message = _format_exception(exc)
+        record.error = error_message
         record.status = TaskStatus.FAILED
-        _update_task_history(task_id, "failed", error=str(exc))
+        _update_task_history(task_id, "failed", error=error_message)
 
     # Fire webhook if configured
     if record.webhook_url:
