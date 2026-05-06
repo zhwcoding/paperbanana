@@ -3,7 +3,7 @@
 
 vlm:
   provider: kie
-  model: gemini-3-flash
+  model: gemini-3-pro
 
 image:
   provider: kie_imagen

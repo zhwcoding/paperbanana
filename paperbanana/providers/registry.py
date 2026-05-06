@@ -40,8 +40,15 @@ class ProviderRegistry:
                 api_key=settings.kie_api_key,
                 model=settings.vlm_model,
             )
+        elif provider == "deepseek":
+            from paperbanana.providers.vlm.deepseek import DeepSeekVLM
+
+            return DeepSeekVLM(
+                api_key=settings.deepseek_api_key,
+                model=settings.vlm_model,
+            )
         else:
-            raise ValueError(f"Unknown VLM provider: {provider}. Available: gemini, openrouter, kie")
+            raise ValueError(f"Unknown VLM provider: {provider}. Available: gemini, openrouter, kie, deepseek")
 
     @staticmethod
     def create_image_gen(settings: Settings) -> ImageGenProvider:
