@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     openrouter_api_key: Optional[str] = Field(default=None, alias="OPENROUTER_API_KEY")
     kie_api_key: Optional[str] = Field(default=None, alias="KIE_API_KEY")
     deepseek_api_key: Optional[str] = Field(default=None, alias="DEEPSEEK_API_KEY")
+    apimart_api_key: Optional[str] = Field(default=None, alias="APIMART_API_KEY")
 
     # SSL
     skip_ssl_verification: bool = Field(default=False, alias="SKIP_SSL_VERIFICATION")

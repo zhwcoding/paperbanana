@@ -1,4 +1,4 @@
-"""Kie.ai VLM provider — OpenAI-compatible API."""
+"""APImart VLM provider — OpenAI-compatible API aggregator."""
 
 from __future__ import annotations
 
@@ -14,13 +14,18 @@ from paperbanana.providers.base import VLMProvider
 logger = structlog.get_logger()
 
 
-class KieVLM(VLMProvider):
-    """VLM provider using Kie.ai's OpenAI-compatible API."""
+class APIMartVLM(VLMProvider):
+    """VLM provider using APImart's OpenAI-compatible API.
+
+    APImart is an API aggregator that provides access to multiple AI models
+    through a unified OpenAI-compatible interface.
+    Base URL: https://api.apimart.ai
+    """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gemini-3-pro",
+        model: str = "gemini-2.5-pro",
     ):
         self._api_key = api_key
         self._model = model
@@ -28,7 +33,7 @@ class KieVLM(VLMProvider):
 
     @property
     def name(self) -> str:
-        return "kie"
+        return "apimart"
 
     @property
     def model_name(self) -> str:
@@ -37,13 +42,9 @@ class KieVLM(VLMProvider):
     def _get_client(self):
         if self._client is None:
             import httpx
-            import os
-
-            # 支持从环境变量读取 base URL，方便使用中转站
-            base_url = os.getenv("KIE_BASE_URL", "https://api.kie.ai")
 
             self._client = httpx.AsyncClient(
-                base_url=base_url,
+                base_url="https://api.apimart.ai",
                 headers={
                     "Authorization": f"Bearer {self._api_key}",
                     "Content-Type": "application/json",
@@ -85,33 +86,39 @@ class KieVLM(VLMProvider):
         messages.append({"role": "user", "content": content})
 
         payload = {
+            "model": self._model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False,
         }
 
-        # For gemini-3-pro, use low reasoning effort for faster responses
-        if "gemini-3-pro" in self._model:
-            payload["reasoning_effort"] = "low"
-
         if response_format == "json":
             payload["response_format"] = {"type": "json_object"}
 
-        response = await client.post(
-            f"/{self._model}/v1/chat/completions", json=payload
-        )
+        response = await client.post("/v1/chat/completions", json=payload)
 
         if response.is_error:
             detail = response.text.strip()
             raise RuntimeError(
-                f"Kie VLM HTTP {response.status_code}: {detail or 'empty response body'}"
+                f"APImart VLM HTTP {response.status_code}: {detail or 'empty response body'}"
             )
 
         data = response.json()
-        text = data["choices"][0]["message"]["content"]
+
+        # APImart返回格式可能包含code字段
+        if "code" in data and data["code"] != 200:
+            raise RuntimeError(f"APImart API error: {data.get('message', data)}")
+
+        # 兼容两种返回格式
+        if "data" in data:
+            choices = data["data"]["choices"]
+        else:
+            choices = data["choices"]
+
+        text = choices[0]["message"]["content"]
         if isinstance(text, list):
             text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
 
-        logger.debug("Kie VLM response", model=self._model, usage=data.get("usage"))
+        logger.debug("APImart VLM response", model=self._model, usage=data.get("usage"))
         return text

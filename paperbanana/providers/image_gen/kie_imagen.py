@@ -61,9 +61,13 @@ class KieImageGen(ImageGenProvider):
         """Lazy-init an async httpx client for the Kie.ai API."""
         if self._client is None:
             import httpx
+            import os
+
+            # 支持从环境变量读取 base URL，方便使用中转站
+            base_url = os.getenv("KIE_BASE_URL", "https://api.kie.ai")
 
             self._client = httpx.AsyncClient(
-                base_url="https://api.kie.ai",
+                base_url=base_url,
                 headers={
                     "Authorization": f"Bearer {self._api_key}",
                     "Content-Type": "application/json",
